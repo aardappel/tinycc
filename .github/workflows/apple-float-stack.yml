@@ -1,0 +1,51 @@
+name: Apple ARM64 float stack regression
+
+on:
+  push:
+    branches: [codex/apple-arm64-float-stack-ci]
+
+permissions:
+  contents: read
+
+jobs:
+  apple-arm64:
+    runs-on: macos-15
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        optimization: [-O0, -O2]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify Apple Silicon runner
+        run: |
+          uname -a
+          test "$(uname -m)" = arm64
+          clang --version
+      - name: Build unpatched upstream with new regression tests
+        run: |
+          git show 43c7708b85681a2fd4451c8a541af4494a8919b2:arm64-gen.c > arm64-gen.c
+          ./configure --cc=clang
+          make -j3
+          make -C tests abitest-cc.exe CC="clang ${{ matrix.optimization }}"
+      - name: Verify the three fixed-argument regressions fail before the fix
+        run: |
+          for name in hfa scalar align; do
+            if ./tests/abitest-cc.exe -B. run_test=float_stack_${name}_test; then
+              echo "::error::Unpatched upstream unexpectedly passed ${name}"
+              exit 1
+            fi
+          done
+          ./tests/abitest-cc.exe -B. run_test=float_stack_stdarg_test
+      - name: Build the submitted fix
+        run: |
+          git show 104441ba:arm64-gen.c > arm64-gen.c
+          make -j3
+          make -B -C tests abitest-cc.exe CC="clang ${{ matrix.optimization }}"
+      - name: Verify native and TinyCC ABI compatibility after the fix
+        run: ./tests/abitest-cc.exe -B.
+      - name: Run full upstream suite
+        if: matrix.optimization == '-O0'
+        run: make test
