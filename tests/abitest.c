@@ -635,6 +635,90 @@ static int arg_align_test(void) {
   return run_callback(src, arg_align_test_callback);
 }
 
+/* Test both directions across the native/TinyCC boundary.  In particular,
+   Apple arm64 packs fixed float/HFA stack arguments at natural alignment,
+   but rounds up to an eight-byte slot before the first variadic argument. */
+#define FLOAT_STACK_TYPES \
+  typedef struct { float x; float y; float z; } float_stack_v3; \
+  typedef struct { float x; float y; float z; float w; } float_stack_v4;
+
+FLOAT_STACK_TYPES
+
+#define FLOAT_STACK_TEST(name, params, args, body) \
+  typedef int (*name ## _fn) params; \
+  static int name ## _callee params body \
+  static int name ## _callback(void *ptr) { \
+    int (*f)(name ## _fn, name ## _fn *) = \
+        (int (*)(name ## _fn, name ## _fn *))ptr; \
+    float_stack_v3 v = {1, 2, 3}; \
+    float_stack_v4 w = {4, 5, 6, 7}; \
+    name ## _fn jit; \
+    int result = f(name ## _callee, &jit); \
+    if (!result) \
+      fputs("TinyCC -> native failed; ", stdout); \
+    if (!jit args) { \
+      fputs("native -> TinyCC failed; ", stdout); \
+      result = 0; \
+    } \
+    return result ? 0 : -1; \
+  } \
+  static int name ## _test(void) { \
+    const char *src = "#include <stdarg.h>\n" STR(FLOAT_STACK_TYPES) \
+      "typedef int (*Fn)" STR(params) ";" \
+      "int check" STR(params) STR(body) \
+      "int f(Fn native, Fn *jit) {" \
+      "  float_stack_v3 v = {1, 2, 3};" \
+      "  float_stack_v4 w = {4, 5, 6, 7};" \
+      "  *jit = check; return native" STR(args) ";" \
+      "}"; \
+    return run_callback(src, name ## _callback); \
+  }
+
+/* The third HFA spills even though two vector registers remain.  Its tail
+   must not be rounded up, and the following float must also use the stack. */
+FLOAT_STACK_TEST(float_stack_hfa,
+  (float_stack_v3 a, float_stack_v3 b, float_stack_v3 c, float d, double e),
+  (v, v, v, 8.0f, 9.0),
+  { return a.x == 1 && a.y == 2 && a.z == 3 &&
+           b.x == 1 && b.y == 2 && b.z == 3 &&
+           c.x == 1 && c.y == 2 && c.z == 3 && d == 8 && e == 9; })
+
+/* Consecutive spilled floats occupy four bytes each on Apple arm64. */
+FLOAT_STACK_TEST(float_stack_scalar,
+  (float a, float b, float c, float d, float e, float f, float g, float h,
+   float i, float j, float k, double l),
+  (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12),
+  { return a == 1 && b == 2 && c == 3 && d == 4 && e == 5 && f == 6 &&
+           g == 7 && h == 8 && i == 9 && j == 10 && k == 11 && l == 12; })
+
+/* A spilled HFA may start four bytes into a slot; doubles still need
+   eight-byte alignment after the packed floats. */
+FLOAT_STACK_TEST(float_stack_align,
+  (float_stack_v4 a, float_stack_v4 b, float c, float_stack_v3 d,
+   float e, double f),
+  (w, w, 8.0f, v, 9.0f, 10.0),
+  { return a.x == 4 && a.y == 5 && a.z == 6 && a.w == 7 &&
+           b.x == 4 && b.y == 5 && b.z == 6 && b.w == 7 && c == 8 &&
+           d.x == 1 && d.y == 2 && d.z == 3 && e == 9 && f == 10; })
+
+/* The last fixed parameter ends at offset 12 on Apple arm64.  Both the
+   caller and va_start must round up before the variadic arguments. */
+FLOAT_STACK_TEST(float_stack_stdarg,
+  (float_stack_v3 a, float_stack_v3 b, float_stack_v3 c, ...),
+  (v, v, v, 8.0, 9.0, 10),
+  { va_list ap;
+    double x;
+    double y;
+    int z;
+    va_start(ap, c);
+    x = va_arg(ap, double);
+    y = va_arg(ap, double);
+    z = va_arg(ap, int);
+    va_end(ap);
+    return a.x == 1 && a.y == 2 && a.z == 3 &&
+           b.x == 1 && b.y == 2 && b.z == 3 &&
+           c.x == 1 && c.y == 2 && c.z == 3 && x == 8 && y == 9 && z == 10; })
+
 #define RUN_TEST(t) \
   if (!testname || (strcmp(#t, testname) == 0)) { \
     fputs(#t "... ", stdout); \
@@ -687,5 +771,9 @@ int main(int argc, char **argv) {
   RUN_TEST(stdarg_many_test);
   RUN_TEST(stdarg_struct_test);
   RUN_TEST(arg_align_test);
+  RUN_TEST(float_stack_hfa_test);
+  RUN_TEST(float_stack_scalar_test);
+  RUN_TEST(float_stack_align_test);
+  RUN_TEST(float_stack_stdarg_test);
   return retval;
 }
